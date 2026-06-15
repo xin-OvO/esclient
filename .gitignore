@@ -1,0 +1,13 @@
+node_modules/
+out/
+dist/
+release/
+.vite/
+*.log
+.DS_Store
+coverage/
+.env
+.env.*
+task_plan.md
+progress.md
+findings.md
