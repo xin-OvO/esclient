@@ -46,7 +46,7 @@
   },
   "build": {
     "appId": "com.wangxin.esclient",
-    "productName": "ES 中文客户端",
+    "productName": "ESClient",
     "directories": {
       "output": "release"
     },
