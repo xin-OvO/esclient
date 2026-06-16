@@ -1,7 +1,8 @@
-import { app, BrowserWindow, ipcMain, safeStorage } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, safeStorage } from 'electron'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { readFile, writeFile } from 'node:fs/promises'
 import Store from 'electron-store'
 import { Client } from '@elastic/elasticsearch'
 import type {
@@ -10,6 +11,13 @@ import type {
   ConnectionInfo,
   ConnectionInput,
   ConnectionProfile,
+  DocumentAggregationRequest,
+  DocumentAggregationResult,
+  DocumentExportRequest,
+  DocumentExportPayload,
+  DocumentImportItem,
+  DocumentImportRequest,
+  DocumentImportResult,
   DocumentRow,
   DocumentSearchRequest,
   DocumentSearchResult,
@@ -23,6 +31,7 @@ import type {
   TemplatePutRequest,
   TemplateSummary
 } from '../shared/types'
+import { parseSearchBody } from '../shared/query'
 
 interface StoredConnection extends Omit<ConnectionProfile, 'hasSecret'> {
   secret?: string
@@ -40,6 +49,17 @@ const store = new Store<StoreShape>({
 
 const clients = new Map<string, Client>()
 const currentDir = fileURLToPath(new URL('.', import.meta.url))
+const DEFAULT_SEARCH_SIZE = 50
+const DEFAULT_RESULT_WINDOW = 10000
+const DEEP_PAGE_BATCH_SIZE = 500
+const MAX_EXPORT_DOCUMENTS = 100000
+const IMPORT_PROGRESS_BATCH_SIZE = 50
+
+interface ParsedImportFile {
+  index?: string
+  mappings?: Record<string, unknown>
+  documents: DocumentImportItem[]
+}
 
 const ok = <T>(data: T): ApiResult<T> => ({ ok: true, data })
 
@@ -91,6 +111,31 @@ const fail = (error: unknown): ApiResult<never> => {
       details: safeDetails(maybeError.meta || error)
     }
   }
+}
+
+const emitProgress = (
+  sender: Electron.WebContents,
+  progress: {
+    operationId?: string
+    type: 'import' | 'export'
+    phase: string
+    current: number
+    total?: number
+    message: string
+  }
+): void => {
+  if (!progress.operationId) {
+    return
+  }
+
+  sender.send('operation:progress', {
+    ...progress,
+    operationId: progress.operationId,
+    percent:
+      typeof progress.total === 'number' && progress.total > 0
+        ? Math.min(100, Math.round((progress.current / progress.total) * 100))
+        : undefined
+  })
 }
 
 const publicConnection = (connection: StoredConnection): ConnectionProfile => ({
@@ -255,172 +300,6 @@ const getConnectionInfo = async (client: Client, connection: StoredConnection): 
   }
 }
 
-const parseLiteralValue = (rawValue: string): string | number | boolean | null => {
-  const trimmed = rawValue.trim()
-  if (!trimmed) {
-    return ''
-  }
-
-  const unquoted = trimmed.replace(/^['"]|['"]$/g, '')
-  const lower = unquoted.toLowerCase()
-
-  if (lower === 'true') return true
-  if (lower === 'false') return false
-  if (lower === 'null') return null
-  if (/^-?\d+(\.\d+)?$/.test(unquoted)) return Number(unquoted)
-
-  return unquoted
-}
-
-const splitConditionText = (
-  text: string
-): { parts: string[]; connectors: Array<'and' | 'or'> } => {
-  const parts: string[] = []
-  const connectors: Array<'and' | 'or'> = []
-  let current = ''
-  let quote: '"' | "'" | undefined
-  let parenDepth = 0
-
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index]
-    const nextChunk = text.slice(index)
-
-    if ((char === '"' || char === "'") && text[index - 1] !== '\\') {
-      quote = quote === char ? undefined : quote || char
-      current += char
-      continue
-    }
-
-    if (!quote) {
-      if (char === '(') parenDepth += 1
-      if (char === ')') parenDepth = Math.max(0, parenDepth - 1)
-
-      const connectorMatch = nextChunk.match(/^\s+(and|or)\s+/i)
-      if (parenDepth === 0 && connectorMatch) {
-        parts.push(current.trim())
-        connectors.push(connectorMatch[1].toLowerCase() as 'and' | 'or')
-        index += connectorMatch[0].length - 1
-        current = ''
-        continue
-      }
-    }
-
-    current += char
-  }
-
-  if (current.trim()) {
-    parts.push(current.trim())
-  }
-
-  return { parts, connectors }
-}
-
-const parseConditionClause = (clause: string): Record<string, unknown> => {
-  const match = clause.match(/^([\w.@-]+)\s*(>=|<=|!=|=|>|<|like|in)\s*(.+)$/i)
-  if (!match) {
-    throw new Error(`查询条件格式不正确：${clause}`)
-  }
-
-  const [, field, rawOperator, rawValue] = match
-  const operator = rawOperator.toLowerCase()
-
-  if (operator === 'like') {
-    const value = String(parseLiteralValue(rawValue)).replace(/\*/g, '')
-    return { wildcard: { [field]: `*${value}*` } }
-  }
-
-  if (operator === 'in') {
-    const normalized = rawValue.trim().replace(/^\(|\)$/g, '').replace(/^\[|\]$/g, '')
-    const values = normalized
-      .split(',')
-      .map((item) => parseLiteralValue(item))
-      .filter((item) => item !== '')
-
-    if (!values.length) {
-      throw new Error(`in 查询至少需要一个值：${clause}`)
-    }
-
-    return { terms: { [field]: values } }
-  }
-
-  const value = parseLiteralValue(rawValue)
-
-  if (operator === '=') {
-    if (typeof value === 'string') {
-      return { match_phrase: { [field]: value } }
-    }
-
-    return { term: { [field]: value } }
-  }
-
-  if (operator === '!=') {
-    return {
-      bool: {
-        must_not: [
-          typeof value === 'string'
-            ? { match_phrase: { [field]: value } }
-            : { term: { [field]: value } }
-        ]
-      }
-    }
-  }
-
-  const rangeOperatorMap: Record<string, string> = {
-    '>=': 'gte',
-    '<=': 'lte',
-    '>': 'gt',
-    '<': 'lt'
-  }
-
-  return { range: { [field]: { [rangeOperatorMap[operator]]: value } } }
-}
-
-const parseConditionQuery = (text: string): Record<string, unknown> => {
-  const { parts, connectors } = splitConditionText(text)
-  const queries = parts.map(parseConditionClause)
-
-  if (!queries.length) {
-    return { query: { match_all: {} } }
-  }
-
-  if (connectors.length && connectors.some((item) => item === 'or')) {
-    const groups: Array<Record<string, unknown>[]> = [[]]
-
-    queries.forEach((query, index) => {
-      groups[groups.length - 1].push(query)
-      if (connectors[index] === 'or') {
-        groups.push([])
-      }
-    })
-
-    const should = groups
-      .filter((group) => group.length)
-      .map((group) => (group.length === 1 ? group[0] : { bool: { must: group } }))
-
-    return { query: { bool: { should, minimum_should_match: 1 } } }
-  }
-
-  return { query: { bool: { must: queries } } }
-}
-
-const parseSearchBody = (text?: string): Record<string, unknown> => {
-  if (!text?.trim()) {
-    return { query: { match_all: {} } }
-  }
-
-  const trimmed = text.trim()
-  if (!trimmed.startsWith('{')) {
-    return parseConditionQuery(trimmed)
-  }
-
-  const parsed = JSON.parse(trimmed) as unknown
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('JSON 查询必须是对象')
-  }
-
-  return parsed as Record<string, unknown>
-}
-
 const flattenHit = (hit: Record<string, unknown>): DocumentRow => ({
   _id: String(hit._id),
   _index: String(hit._index),
@@ -428,7 +307,459 @@ const flattenHit = (hit: Record<string, unknown>): DocumentRow => ({
   _source: ((hit._source || {}) as Record<string, unknown>) || {}
 })
 
+const isRecord = (value: unknown): value is Record<string, unknown> => {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+const normalizeNumber = (value: number | undefined, fallback: number): number => {
+  if (!Number.isFinite(value) || !value) {
+    return fallback
+  }
+
+  return Math.max(1, Math.floor(value))
+}
+
+const extractTotal = (result: Record<string, unknown>): number => {
+  const hitsRoot = result.hits as
+    | {
+        total?: number | { value?: number }
+      }
+    | undefined
+
+  return typeof hitsRoot?.total === 'number'
+    ? hitsRoot.total
+    : typeof hitsRoot?.total?.value === 'number'
+      ? hitsRoot.total.value
+      : 0
+}
+
+const extractHits = (result: Record<string, unknown>): Array<Record<string, unknown>> => {
+  const hitsRoot = result.hits as
+    | {
+        hits?: Array<Record<string, unknown>>
+      }
+    | undefined
+
+  return hitsRoot?.hits || []
+}
+
+const getSortValues = (hit: Record<string, unknown>): unknown[] | undefined => {
+  return Array.isArray(hit.sort) ? hit.sort : undefined
+}
+
+const normalizeSearchBody = (body: Record<string, unknown>): Record<string, unknown> => {
+  const { from: _from, size: _size, search_after: _searchAfter, ...rest } = body
+  return rest
+}
+
+interface AggregationBucketNode {
+  key?: string | number | boolean | null
+  doc_count?: number
+  metric_value?: { value?: number | null }
+  next?: {
+    buckets?: AggregationBucketNode[]
+  }
+}
+
+const normalizeGroupFields = (payload: DocumentAggregationRequest): string[] => {
+  const fields = (payload.groupFields?.length ? payload.groupFields : payload.groupField ? [payload.groupField] : [])
+    .map((field) => field.trim())
+    .filter(Boolean)
+
+  return Array.from(new Set(fields)).slice(0, 5)
+}
+
+const buildNestedTermsAggregation = (
+  fields: string[],
+  size: number,
+  metricAgg: Record<string, unknown>
+): Record<string, unknown> => {
+  const buildLevel = (index: number): Record<string, unknown> => {
+    const isLeaf = index === fields.length - 1
+    return {
+      terms: {
+        field: fields[index],
+        size
+      },
+      aggs: isLeaf ? metricAgg : { next: buildLevel(index + 1) }
+    }
+  }
+
+  return buildLevel(0)
+}
+
+const flattenAggregationBuckets = (
+  buckets: AggregationBucketNode[],
+  groupDepth: number,
+  parentKeys: Array<string | number | boolean | null> = []
+): DocumentAggregationResult['buckets'] => {
+  return buckets.flatMap((bucket) => {
+    const key = bucket.key === '__MISSING__' ? null : (bucket.key ?? null)
+    const keys = [...parentKeys, key]
+
+    if (keys.length < groupDepth) {
+      return flattenAggregationBuckets(bucket.next?.buckets || [], groupDepth, keys)
+    }
+
+    return [
+      {
+        keys,
+        key: keys.join(' / '),
+        count: bucket.doc_count || 0,
+        value: bucket.metric_value?.value ?? undefined
+      }
+    ]
+  })
+}
+
+const getDeepPageSort = (body: Record<string, unknown>): unknown => {
+  return body.sort === undefined ? [{ _doc: 'asc' }] : body.sort
+}
+
+const searchDocuments = async (
+  client: Client,
+  payload: DocumentSearchRequest
+): Promise<DocumentSearchResult> => {
+  const requestedFrom = Math.max(0, Math.floor(payload.from || 0))
+  const size = normalizeNumber(payload.size, DEFAULT_SEARCH_SIZE)
+  const rawBody = parseSearchBody(payload.queryText)
+  const body = normalizeSearchBody(rawBody)
+  let took: number | undefined
+  let rows: DocumentRow[] = []
+
+  if (requestedFrom + size <= DEFAULT_RESULT_WINDOW) {
+    const result = (await client.search({
+      index: payload.index,
+      from: requestedFrom,
+      size,
+      track_total_hits: true,
+      body
+    })) as Record<string, unknown>
+
+    took = result.took as number | undefined
+    rows = extractHits(result).map(flattenHit)
+    return {
+      rows,
+      total: extractTotal(result),
+      took
+    }
+  }
+
+  const totalResult = (await client.search({
+    index: payload.index,
+    size: 0,
+    track_total_hits: true,
+    body
+  })) as Record<string, unknown>
+  const total = extractTotal(totalResult)
+
+  if (requestedFrom >= total) {
+    return { rows: [], total, took: 0 }
+  }
+
+  let remainingToSkip = requestedFrom
+  let searchAfter: unknown[] | undefined
+  let accumulatedTook = 0
+  const deepSort = getDeepPageSort(body)
+
+  while (remainingToSkip > 0) {
+    const batchSize = Math.min(DEEP_PAGE_BATCH_SIZE, remainingToSkip)
+    const result = (await client.search({
+      index: payload.index,
+      size: batchSize,
+      track_total_hits: false,
+      body: {
+        ...body,
+        sort: deepSort,
+        ...(searchAfter ? { search_after: searchAfter } : {})
+      }
+    })) as Record<string, unknown>
+    const hits = extractHits(result)
+    accumulatedTook += (result.took as number | undefined) || 0
+
+    if (!hits.length) {
+      return { rows: [], total, took: accumulatedTook }
+    }
+
+    remainingToSkip -= hits.length
+    searchAfter = getSortValues(hits[hits.length - 1])
+
+    if (!searchAfter || hits.length < batchSize) {
+      return { rows: [], total, took: accumulatedTook }
+    }
+  }
+
+  const pageResult = (await client.search({
+    index: payload.index,
+    size,
+    track_total_hits: false,
+    body: {
+      ...body,
+      sort: deepSort,
+      ...(searchAfter ? { search_after: searchAfter } : {})
+    }
+  })) as Record<string, unknown>
+
+  accumulatedTook += (pageResult.took as number | undefined) || 0
+
+  return {
+    rows: extractHits(pageResult).map(flattenHit),
+    total,
+    took: accumulatedTook
+  }
+}
+
+const aggregateDocuments = async (
+  client: Client,
+  payload: DocumentAggregationRequest
+): Promise<DocumentAggregationResult> => {
+  const groupFields = normalizeGroupFields(payload)
+
+  if (!groupFields.length) {
+    throw new Error('请选择分组字段')
+  }
+
+  if (payload.metric !== 'count' && !payload.metricField?.trim()) {
+    throw new Error('请选择指标字段')
+  }
+
+  const size = Math.min(1000, Math.max(1, Math.floor(payload.size || 100)))
+  const body = normalizeSearchBody(parseSearchBody(payload.queryText))
+  const metricAgg =
+    payload.metric === 'count'
+      ? {}
+      : {
+          metric_value: {
+            [payload.metric]: {
+              field: payload.metricField
+            }
+          }
+        }
+  const groupsAgg = buildNestedTermsAggregation(groupFields, size, metricAgg)
+  const result = (await client.search({
+    index: payload.index,
+    size: 0,
+    track_total_hits: true,
+    body: {
+      ...body,
+      aggs: {
+        groups: groupsAgg
+      }
+    }
+  })) as Record<string, unknown>
+  const aggregations = result.aggregations as
+    | {
+        groups?: {
+          buckets?: AggregationBucketNode[]
+        }
+      }
+    | undefined
+
+  return {
+    buckets: flattenAggregationBuckets(aggregations?.groups?.buckets || [], groupFields.length),
+    total: extractTotal(result),
+    took: result.took as number | undefined,
+    metric: payload.metric,
+    groupFields
+  }
+}
+
+const extractCreateIndexBody = (payload: ParsedImportFile, fallbackIndex: string): Record<string, unknown> | undefined => {
+  const mappings = payload.mappings
+  if (!isRecord(mappings)) {
+    return undefined
+  }
+
+  const sourceIndex = payload.index || fallbackIndex
+  const indexEntry = isRecord(mappings[sourceIndex])
+    ? (mappings[sourceIndex] as Record<string, unknown>)
+    : Object.values(mappings).find(isRecord)
+  const rawMappings = isRecord(indexEntry?.mappings)
+    ? (indexEntry.mappings as Record<string, unknown>)
+    : isRecord(mappings.mappings)
+      ? (mappings.mappings as Record<string, unknown>)
+      : isRecord(mappings.properties)
+        ? mappings
+        : undefined
+
+  if (!rawMappings) {
+    return undefined
+  }
+
+  return {
+    mappings: rawMappings
+  }
+}
+
+const parseImportPayload = (content: string, fallbackIndex: string): ParsedImportFile => {
+  const trimmed = content.trim()
+  if (!trimmed) {
+    throw new Error('导入文件为空')
+  }
+
+  const fromRecord = (record: Record<string, unknown>): DocumentImportItem => {
+    const hasWrappedSource = isRecord(record._source) || isRecord(record.document) || isRecord(record.doc)
+    const source = isRecord(record._source)
+      ? record._source
+      : isRecord(record.document)
+        ? record.document
+        : isRecord(record.doc)
+          ? record.doc
+          : record
+    const body = source === record ? { ...record } : source
+
+    if (source === record) {
+      delete body._id
+      delete body._index
+    }
+
+    if (!isRecord(body)) {
+      throw new Error('导入文档必须是 JSON 对象')
+    }
+
+    return {
+      id:
+        typeof record._id === 'string'
+          ? record._id
+          : hasWrappedSource && typeof record.id === 'string'
+            ? record.id
+            : undefined,
+      index:
+        typeof record._index === 'string'
+          ? record._index
+          : hasWrappedSource && typeof record.index === 'string'
+            ? record.index
+            : fallbackIndex,
+      document: body
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown
+    if (Array.isArray(parsed)) {
+      return {
+        documents: parsed.map((item) => {
+          if (!isRecord(item)) {
+            throw new Error('数组导入项必须是 JSON 对象')
+          }
+          return fromRecord(item)
+        })
+      }
+    }
+
+    if (isRecord(parsed)) {
+      if (Array.isArray(parsed.documents)) {
+        return {
+          index: typeof parsed.index === 'string' ? parsed.index : undefined,
+          mappings: isRecord(parsed.mappings) ? parsed.mappings : undefined,
+          documents: parsed.documents.map((item) => {
+            if (!isRecord(item)) {
+              throw new Error('documents 数组导入项必须是 JSON 对象')
+            }
+            return fromRecord(item)
+          })
+        }
+      }
+
+      return {
+        documents: [fromRecord(parsed)]
+      }
+    }
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      // Fall through to JSONL / bulk style parsing.
+    } else {
+      throw error
+    }
+  }
+
+  const lines = trimmed
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+  const imported: DocumentImportItem[] = []
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const parsed = JSON.parse(lines[index]) as unknown
+    if (!isRecord(parsed)) {
+      throw new Error(`第 ${index + 1} 行不是 JSON 对象`)
+    }
+
+    const meta = parsed.index || parsed.create
+    if (isRecord(meta)) {
+      const nextLine = lines[index + 1]
+      if (!nextLine) {
+        throw new Error(`第 ${index + 1} 行 bulk 元数据缺少文档内容`)
+      }
+      const document = JSON.parse(nextLine) as unknown
+      if (!isRecord(document)) {
+        throw new Error(`第 ${index + 2} 行不是 JSON 对象`)
+      }
+      imported.push({
+        id: typeof meta._id === 'string' ? meta._id : undefined,
+        index: typeof meta._index === 'string' ? meta._index : fallbackIndex,
+        document
+      })
+      index += 1
+    } else {
+      imported.push(fromRecord(parsed))
+    }
+  }
+
+  if (!imported.length) {
+    throw new Error('未解析到可导入文档')
+  }
+
+  return {
+    documents: imported
+  }
+}
+
 const registerIpc = (): void => {
+  ipcMain.handle('files:open-json', async () => {
+    const window = BrowserWindow.getFocusedWindow()
+    const result = await dialog.showOpenDialog(window || undefined, {
+      title: '导入 JSON 文档',
+      properties: ['openFile'],
+      filters: [
+        { name: 'JSON 文档', extensions: ['json', 'jsonl', 'ndjson'] },
+        { name: '所有文件', extensions: ['*'] }
+      ]
+    })
+
+    if (result.canceled || !result.filePaths[0]) {
+      return { canceled: true }
+    }
+
+    return {
+      canceled: false,
+      filePath: result.filePaths[0],
+      content: await readFile(result.filePaths[0], 'utf8')
+    }
+  })
+
+  ipcMain.handle('files:save-json', async (_event, payload: { defaultFileName: string; content: string }) => {
+    const window = BrowserWindow.getFocusedWindow()
+    const result = await dialog.showSaveDialog(window || undefined, {
+      title: '导出 JSON 文档',
+      defaultPath: payload.defaultFileName,
+      filters: [
+        { name: 'JSON 文档', extensions: ['json'] },
+        { name: '所有文件', extensions: ['*'] }
+      ]
+    })
+
+    if (result.canceled || !result.filePath) {
+      return { canceled: true }
+    }
+
+    await writeFile(result.filePath, payload.content, 'utf8')
+    return {
+      canceled: false,
+      filePath: result.filePath
+    }
+  })
+
   ipcMain.handle('connections:list', async () => {
     try {
       return ok(getConnections().map(publicConnection))
@@ -675,32 +1006,15 @@ const registerIpc = (): void => {
 
   ipcMain.handle('documents:search', async (_event, payload: DocumentSearchRequest) => {
     try {
-      const body = parseSearchBody(payload.queryText)
-      const result = (await getClient(payload.connectionId).search({
-        index: payload.index,
-        from: payload.from || 0,
-        size: payload.size || 50,
-        body
-      })) as Record<string, unknown>
+      return ok<DocumentSearchResult>(await searchDocuments(getClient(payload.connectionId), payload))
+    } catch (error) {
+      return fail(error)
+    }
+  })
 
-      const hitsRoot = result.hits as
-        | {
-            hits?: Array<Record<string, unknown>>
-            total?: number | { value?: number }
-          }
-        | undefined
-      const total =
-        typeof hitsRoot?.total === 'number'
-          ? hitsRoot.total
-          : typeof hitsRoot?.total?.value === 'number'
-            ? hitsRoot.total.value
-            : 0
-
-      return ok<DocumentSearchResult>({
-        rows: (hitsRoot?.hits || []).map(flattenHit),
-        total,
-        took: result.took as number | undefined
-      })
+  ipcMain.handle('documents:aggregate', async (_event, payload: DocumentAggregationRequest) => {
+    try {
+      return ok<DocumentAggregationResult>(await aggregateDocuments(getClient(payload.connectionId), payload))
     } catch (error) {
       return fail(error)
     }
@@ -745,6 +1059,250 @@ const registerIpc = (): void => {
         })
         return ok(undefined)
       } catch (error) {
+        return fail(error)
+      }
+    }
+  )
+
+  ipcMain.handle('documents:import', async (event, payload: DocumentImportRequest) => {
+    try {
+      const client = getClient(payload.connectionId)
+      const targetMode = payload.mode || 'existing'
+      const targetIndex = (payload.targetIndex || payload.index).trim()
+      if (!targetIndex) {
+        throw new Error('请选择目标索引')
+      }
+      if (/[*?,]/.test(targetIndex)) {
+        throw new Error('导入目标必须是单个索引，不能包含通配符或多个索引')
+      }
+      emitProgress(event.sender, {
+        operationId: payload.operationId,
+        type: 'import',
+        phase: 'parsing',
+        current: 0,
+        message: '正在解析导入文件'
+      })
+      const parsedPayload: ParsedImportFile = payload.documents?.length
+        ? { documents: payload.documents }
+        : payload.content
+          ? parseImportPayload(payload.content, payload.index)
+          : { documents: [] }
+      const documents = parsedPayload.documents
+      const result: DocumentImportResult = {
+        imported: 0,
+        failed: 0,
+        targetIndices: [],
+        overwritten: 0,
+        created: 0,
+        mode: 'upsert',
+        targetMode,
+        indexCreated: false,
+        errors: []
+      }
+
+      if (!documents.length) {
+        throw new Error('没有可导入的文档')
+      }
+
+      if (targetMode === 'create') {
+        const createBody = extractCreateIndexBody(parsedPayload, payload.index)
+        if (!createBody) {
+          throw new Error('导入文件没有可用于创建索引的 mapping')
+        }
+        emitProgress(event.sender, {
+          operationId: payload.operationId,
+          type: 'import',
+          phase: 'creating-index',
+          current: 0,
+          total: documents.length,
+          message: `正在创建索引 ${targetIndex}`
+        })
+        await client.indices.create({
+          index: targetIndex,
+          ...(createBody ? { body: createBody } : {})
+        })
+        result.indexCreated = true
+      }
+
+      const targetIndices = new Set<string>()
+      targetIndices.add(targetIndex)
+      emitProgress(event.sender, {
+        operationId: payload.operationId,
+        type: 'import',
+        phase: 'importing',
+        current: 0,
+        total: documents.length,
+        message: `准备导入 ${documents.length} 条文档到 ${targetIndex}`
+      })
+
+      for (const [index, item] of documents.entries()) {
+        try {
+          await client.index({
+            index: targetIndex,
+            id: item.id || undefined,
+            document: item.document,
+            refresh: payload.refresh
+          })
+          result.imported += 1
+          if (item.id) {
+            result.overwritten += 1
+          } else {
+            result.created += 1
+          }
+        } catch (error) {
+          result.failed += 1
+          result.errors.push({
+            id: item.id,
+            index: targetIndex,
+            message: error instanceof Error ? error.message : '导入失败'
+          })
+        }
+
+        if ((index + 1) % IMPORT_PROGRESS_BATCH_SIZE === 0 || index === documents.length - 1) {
+          emitProgress(event.sender, {
+            operationId: payload.operationId,
+            type: 'import',
+            phase: 'importing',
+            current: index + 1,
+            total: documents.length,
+            message: `已处理 ${index + 1}/${documents.length} 条`
+          })
+        }
+      }
+
+      result.targetIndices = Array.from(targetIndices)
+      emitProgress(event.sender, {
+        operationId: payload.operationId,
+        type: 'import',
+        phase: 'done',
+        current: documents.length,
+        total: documents.length,
+        message: `导入完成：成功 ${result.imported} 条，失败 ${result.failed} 条`
+      })
+      return ok(result)
+    } catch (error) {
+      emitProgress(event.sender, {
+        operationId: payload.operationId,
+        type: 'import',
+        phase: 'error',
+        current: 0,
+        message: error instanceof Error ? error.message : '导入失败'
+      })
+      return fail(error)
+    }
+  })
+
+  ipcMain.handle(
+    'documents:export',
+    async (event, payload: DocumentExportRequest) => {
+      try {
+        const client = getClient(payload.connectionId)
+        const body = normalizeSearchBody(parseSearchBody(payload.queryText))
+        const documents: DocumentImportItem[] = []
+        let searchAfter: unknown[] | undefined
+        let total = 0
+        const exportSort = getDeepPageSort(body)
+        const mappings = (await client.indices.getMapping({
+          index: payload.index
+        })) as Record<string, unknown>
+
+        emitProgress(event.sender, {
+          operationId: payload.operationId,
+          type: 'export',
+          phase: 'querying',
+          current: 0,
+          message: '正在统计可导出数据'
+        })
+
+        while (documents.length < MAX_EXPORT_DOCUMENTS) {
+          const result = (await client.search({
+            index: payload.index,
+            size: Math.min(DEEP_PAGE_BATCH_SIZE, MAX_EXPORT_DOCUMENTS - documents.length),
+            track_total_hits: documents.length === 0,
+            body: {
+              ...body,
+              sort: exportSort,
+              ...(searchAfter ? { search_after: searchAfter } : {})
+            }
+          })) as Record<string, unknown>
+          const hits = extractHits(result)
+
+          if (documents.length === 0) {
+            total = extractTotal(result)
+            emitProgress(event.sender, {
+              operationId: payload.operationId,
+              type: 'export',
+              phase: 'exporting',
+              current: 0,
+              total: Math.min(total, MAX_EXPORT_DOCUMENTS),
+              message: `准备导出 ${Math.min(total, MAX_EXPORT_DOCUMENTS)} 条文档`
+            })
+          }
+
+          if (!hits.length) {
+            break
+          }
+
+          hits.forEach((hit) => {
+            const row = flattenHit(hit)
+            documents.push({
+              id: row._id,
+              index: row._index,
+              document: row._source
+            })
+          })
+
+          searchAfter = getSortValues(hits[hits.length - 1])
+          emitProgress(event.sender, {
+            operationId: payload.operationId,
+            type: 'export',
+            phase: 'exporting',
+            current: documents.length,
+            total: Math.min(total || documents.length, MAX_EXPORT_DOCUMENTS),
+            message: `已读取 ${documents.length}/${Math.min(total || documents.length, MAX_EXPORT_DOCUMENTS)} 条`
+          })
+          if (!searchAfter || hits.length < DEEP_PAGE_BATCH_SIZE) {
+            break
+          }
+        }
+
+        emitProgress(event.sender, {
+          operationId: payload.operationId,
+          type: 'export',
+          phase: 'serializing',
+          current: documents.length,
+          total: Math.min(total || documents.length, MAX_EXPORT_DOCUMENTS),
+          message: '正在生成导出文件内容'
+        })
+        const exportPayload: DocumentExportPayload = {
+          index: payload.index,
+          exportedAt: new Date().toISOString(),
+          total,
+          exported: documents.length,
+          truncated: documents.length < total,
+          mappings,
+          documents
+        }
+        const content = JSON.stringify(exportPayload, null, 2)
+
+        emitProgress(event.sender, {
+          operationId: payload.operationId,
+          type: 'export',
+          phase: 'done',
+          current: documents.length,
+          total: Math.min(total || documents.length, MAX_EXPORT_DOCUMENTS),
+          message: `导出内容已生成：${documents.length} 条`
+        })
+
+        return ok(content)
+      } catch (error) {
+        emitProgress(event.sender, {
+          operationId: payload.operationId,
+          type: 'export',
+          phase: 'error',
+          current: 0,
+          message: error instanceof Error ? error.message : '导出失败'
+        })
         return fail(error)
       }
     }

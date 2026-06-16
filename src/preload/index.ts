@@ -1,14 +1,24 @@
 import { contextBridge, ipcRenderer } from 'electron'
+import type { IpcRendererEvent } from 'electron'
 import type {
   ApiResult,
   ClusterHealth,
   ConnectionInfo,
   ConnectionInput,
   ConnectionProfile,
+  DocumentAggregationRequest,
+  DocumentAggregationResult,
+  DocumentExportRequest,
+  DocumentImportRequest,
+  DocumentImportResult,
   DocumentSearchRequest,
   DocumentSearchResult,
   DocumentUpdateRequest,
   DocumentWriteRequest,
+  JsonFileOpenResult,
+  JsonFileSaveRequest,
+  JsonFileSaveResult,
+  OperationProgress,
   IndexCreateRequest,
   IndexDeleteRequest,
   IndexSummary,
@@ -22,7 +32,22 @@ const invoke = <T>(channel: string, payload?: unknown): Promise<ApiResult<T>> =>
   return ipcRenderer.invoke(channel, payload)
 }
 
+const invokeJson = <T>(channel: string, payload?: unknown): Promise<T> => {
+  return ipcRenderer.invoke(channel, payload)
+}
+
 export const esClientApi = {
+  files: {
+    openJson: (): Promise<JsonFileOpenResult> => invokeJson('files:open-json'),
+    saveJson: (payload: JsonFileSaveRequest): Promise<JsonFileSaveResult> => invokeJson('files:save-json', payload)
+  },
+  progress: {
+    onOperationProgress: (listener: (progress: OperationProgress) => void): (() => void) => {
+      const wrapped = (_event: IpcRendererEvent, progress: OperationProgress): void => listener(progress)
+      ipcRenderer.on('operation:progress', wrapped)
+      return () => ipcRenderer.removeListener('operation:progress', wrapped)
+    }
+  },
   connections: {
     list: (): Promise<ApiResult<ConnectionProfile[]>> => invoke('connections:list'),
     save: (payload: ConnectionInput & { id?: string }): Promise<ApiResult<ConnectionProfile>> =>
@@ -63,7 +88,13 @@ export const esClientApi = {
     create: (payload: DocumentWriteRequest): Promise<ApiResult<void>> => invoke('documents:create', payload),
     update: (payload: DocumentUpdateRequest): Promise<ApiResult<void>> => invoke('documents:update', payload),
     delete: (payload: { connectionId: string; index: string; id: string; refresh?: boolean }): Promise<ApiResult<void>> =>
-      invoke('documents:delete', payload)
+      invoke('documents:delete', payload),
+    import: (payload: DocumentImportRequest): Promise<ApiResult<DocumentImportResult>> =>
+      invoke('documents:import', payload),
+    export: (payload: DocumentExportRequest): Promise<ApiResult<string>> =>
+      invoke('documents:export', payload),
+    aggregate: (payload: DocumentAggregationRequest): Promise<ApiResult<DocumentAggregationResult>> =>
+      invoke('documents:aggregate', payload)
   }
 }
 

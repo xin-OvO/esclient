@@ -10,9 +10,9 @@ import Form from 'antd/es/form'
 import Input from 'antd/es/input'
 import InputNumber from 'antd/es/input-number'
 import Layout from 'antd/es/layout'
-import Menu from 'antd/es/menu'
 import Modal from 'antd/es/modal'
 import Popconfirm from 'antd/es/popconfirm'
+import Progress from 'antd/es/progress'
 import Radio from 'antd/es/radio'
 import Select from 'antd/es/select'
 import Space from 'antd/es/space'
@@ -28,9 +28,11 @@ import type { DataNode } from 'antd/es/tree'
 import type { ColumnsType } from 'antd/es/table'
 import {
   Braces,
+  ChartColumn,
   ChevronLeft,
   ChevronRight,
   Database,
+  Download,
   Folder,
   Info,
   KeyRound,
@@ -43,6 +45,7 @@ import {
   Settings,
   Table2,
   Trash2,
+  Upload,
   Eye
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
@@ -52,11 +55,16 @@ import type {
   ConnectionInfo,
   ConnectionInput,
   ConnectionProfile,
+  DocumentAggregationResult,
+  AggregationMetric,
+  OperationProgress,
   DocumentRow,
+  DocumentExportPayload,
   DocumentSearchResult,
   IndexSummary,
   TemplateSummary
 } from '../../shared/types'
+import { formatConditionDsl } from '../../shared/query'
 
 const { Header, Sider, Content } = Layout
 const { Text, Title } = Typography
@@ -65,15 +73,19 @@ const DEFAULT_CONDITION_QUERY = ''
 const DEFAULT_INDEX_BODY = '{\n  "settings": {},\n  "mappings": {\n    "properties": {}\n  }\n}'
 const DEFAULT_TEMPLATE_BODY =
   '{\n  "index_patterns": ["logs-*"],\n  "template": {\n    "settings": {},\n    "mappings": {\n      "properties": {}\n    }\n  }\n}'
+const DEFAULT_PAGE_SIZE = 50
 
 type WorkspaceView =
   | { type: 'welcome' }
   | { type: 'connection'; connectionId: string }
   | { type: 'cluster'; connectionId: string }
   | { type: 'indices'; connectionId: string }
-  | { type: 'index'; connectionId: string; index: string; section: 'data' | 'mapping' }
+  | { type: 'index'; connectionId: string; index: string; section: IndexSection }
   | { type: 'templates'; connectionId: string }
   | { type: 'template'; connectionId: string; name: string; templateType: 'index_template' | 'legacy_template' }
+
+type IndexSection = 'data' | 'mapping' | 'aggregation'
+type QueryMode = 'condition' | 'dsl'
 
 interface EditableCell {
   rowId: string
@@ -82,9 +94,48 @@ interface EditableCell {
   originalValue?: unknown
 }
 
+interface MappingField {
+  path: string
+  type: string
+  input: 'text' | 'number' | 'boolean' | 'json'
+  aggregatablePath?: string
+  metricCapable: boolean
+}
+
+interface QueryPreset {
+  id: string
+  name: string
+  mode: QueryMode
+  text: string
+  sortField?: string
+  sortOrder: 'asc' | 'desc'
+  updatedAt: string
+}
+
+interface DocumentViewPreference {
+  visibleFields: string[]
+  sortField?: string
+  sortOrder: 'asc' | 'desc'
+  pageSize: number
+}
+
+type ImportTargetMode = 'existing' | 'create'
+
+interface ImportPreview {
+  index?: string
+  mappings?: Record<string, unknown>
+  documentCount: number
+}
+
+interface PendingImportFile {
+  content: string
+  filePath?: string
+  preview: ImportPreview
+}
+
 const api = window.esClient
 
-const callApi = async <T,>(operation: () => Promise<{ ok: true; data: T } | { ok: false; error: { message: string } }>) => {
+const callApi = async <T,>(operation: () => Promise<{ ok: true; data: T } | { ok: false; error: { code?: string; message: string } }>) => {
   if (!api) {
     return {
       ok: false as const,
@@ -104,6 +155,70 @@ const callApi = async <T,>(operation: () => Promise<{ ok: true; data: T } | { ok
 
 const formatJson = (value: unknown): string => JSON.stringify(value, null, 2)
 
+const toConditionDsl = (value: string): string => {
+  try {
+    return formatConditionDsl(value)
+  } catch {
+    return DEFAULT_QUERY
+  }
+}
+
+const useSyncedQueryState = (): {
+  queryMode: QueryMode
+  setQueryMode: (mode: QueryMode) => void
+  conditionText: string
+  dslText: string
+  queryText: string
+  handleQueryTextChange: (value: string) => void
+  setQueryState: (mode: QueryMode, text: string) => void
+  resetQuery: () => void
+} => {
+  const [queryMode, setQueryMode] = useState<QueryMode>('condition')
+  const [conditionText, setConditionText] = useState(DEFAULT_CONDITION_QUERY)
+  const [dslText, setDslText] = useState(() => toConditionDsl(DEFAULT_CONDITION_QUERY))
+
+  const handleQueryTextChange = (value: string): void => {
+    if (queryMode === 'condition') {
+      setConditionText(value)
+      try {
+        setDslText(formatConditionDsl(value))
+      } catch {
+        // Keep the last valid DSL while the user is still editing an incomplete condition.
+      }
+      return
+    }
+
+    setDslText(value)
+  }
+
+  const resetQuery = (): void => {
+    setConditionText(DEFAULT_CONDITION_QUERY)
+    setDslText(toConditionDsl(DEFAULT_CONDITION_QUERY))
+  }
+
+  const setQueryState = (mode: QueryMode, text: string): void => {
+    setQueryMode(mode)
+    if (mode === 'condition') {
+      setConditionText(text)
+      setDslText(toConditionDsl(text))
+      return
+    }
+
+    setDslText(text || DEFAULT_QUERY)
+  }
+
+  return {
+    queryMode,
+    setQueryMode,
+    conditionText,
+    dslText,
+    queryText: queryMode === 'condition' ? conditionText : dslText,
+    handleQueryTextChange,
+    setQueryState,
+    resetQuery
+  }
+}
+
 const parseJson = (value: string): Record<string, unknown> => {
   const parsed = JSON.parse(value) as unknown
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -112,13 +227,123 @@ const parseJson = (value: string): Record<string, unknown> => {
   return parsed as Record<string, unknown>
 }
 
-const resultMessage = (error: { message: string } | undefined): string => {
-  return error?.message || '操作失败'
+const resultMessage = (error: { code?: string; message: string } | undefined): string => {
+  if (!error) {
+    return '操作失败'
+  }
+
+  const message = error.message || '操作失败'
+  const lowerMessage = message.toLowerCase()
+  let hint = ''
+
+  if (lowerMessage.includes('fielddata') || lowerMessage.includes('text fields are not optimised')) {
+    hint = '。如果是 text 字段，请改用对应的 keyword 子字段排序/聚合'
+  } else if (lowerMessage.includes('no mapping found')) {
+    hint = '。请确认字段名存在，或换一个字段'
+  } else if (lowerMessage.includes('failed to parse') || lowerMessage.includes('json')) {
+    hint = '。请检查 DSL/JSON 格式'
+  }
+
+  const code = error.code && error.code !== 'Error' ? `（${error.code}）` : ''
+  return `${message}${hint}${code}`
+}
+
+const createOperationId = (prefix: string): string => {
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> => {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+const inspectImportContent = (content: string): ImportPreview => {
+  const trimmed = content.trim()
+  if (!trimmed) {
+    return { documentCount: 0 }
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown
+    if (Array.isArray(parsed)) {
+      return { documentCount: parsed.length }
+    }
+
+    if (isPlainRecord(parsed)) {
+      return {
+        index: typeof parsed.index === 'string' ? parsed.index : undefined,
+        mappings: isPlainRecord(parsed.mappings) ? parsed.mappings : undefined,
+        documentCount: Array.isArray(parsed.documents) ? parsed.documents.length : 1
+      }
+    }
+  } catch {
+    // Fall through to line-based preview.
+  }
+
+  const lines = trimmed
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+  let count = 0
+  for (let index = 0; index < lines.length; index += 1) {
+    try {
+      const parsed = JSON.parse(lines[index]) as unknown
+      if (isPlainRecord(parsed) && (isPlainRecord(parsed.index) || isPlainRecord(parsed.create))) {
+        count += 1
+        index += 1
+      } else {
+        count += 1
+      }
+    } catch {
+      count += 1
+    }
+  }
+  return { documentCount: count }
+}
+
+const suggestedImportIndex = (index: string): string => {
+  const safeIndex = index
+    .toLowerCase()
+    .replace(/[*?,]+/g, '')
+    .replace(/[^a-z0-9._-]+/g, '_')
+  return `${safeIndex || 'imported'}_copy`
 }
 
 const hasIndexWildcard = (index: string): boolean => /[*?,]/.test(index)
 
 const getSourceValue = (row: DocumentRow, field: string): unknown => row._source[field]
+
+const buildQueryTextWithSort = (
+  queryText: string,
+  sortField?: string,
+  sortOrder: 'asc' | 'desc' = 'desc'
+): string => {
+  if (!sortField) {
+    return queryText
+  }
+
+  const body = parseJson(queryText || DEFAULT_QUERY)
+  return formatJson({
+    ...body,
+    sort: [{ [sortField]: { order: sortOrder, unmapped_type: 'keyword' } }]
+  })
+}
+
+const storageKey = (...parts: string[]): string => {
+  return `esclient:${parts.map((part) => encodeURIComponent(part)).join(':')}`
+}
+
+const readStorageJson = <T,>(key: string, fallback: T): T => {
+  try {
+    const value = window.localStorage.getItem(key)
+    return value ? (JSON.parse(value) as T) : fallback
+  } catch {
+    return fallback
+  }
+}
+
+const writeStorageJson = (key: string, value: unknown): void => {
+  window.localStorage.setItem(key, JSON.stringify(value))
+}
 
 const normalizeEditableValue = (value: string): unknown => {
   const trimmed = value.trim()
@@ -149,6 +374,158 @@ const normalizeValueForOriginalType = (value: string, originalValue?: unknown): 
   return normalizeEditableValue(value)
 }
 
+const fieldInputType = (type: string): MappingField['input'] => {
+  if (['byte', 'short', 'integer', 'long', 'float', 'half_float', 'scaled_float', 'double'].includes(type)) {
+    return 'number'
+  }
+
+  if (type === 'boolean') {
+    return 'boolean'
+  }
+
+  if (['object', 'nested', 'flattened', 'join', 'geo_point', 'geo_shape'].includes(type)) {
+    return 'json'
+  }
+
+  return 'text'
+}
+
+const isNumberFieldType = (type: string): boolean => {
+  return ['byte', 'short', 'integer', 'long', 'float', 'half_float', 'scaled_float', 'double'].includes(type)
+}
+
+const isDirectlyAggregatableType = (type: string): boolean => {
+  return [
+    'keyword',
+    'constant_keyword',
+    'wildcard',
+    'boolean',
+    'date',
+    'date_nanos',
+    'ip',
+    'version',
+    'byte',
+    'short',
+    'integer',
+    'long',
+    'float',
+    'half_float',
+    'scaled_float',
+    'double'
+  ].includes(type)
+}
+
+const extractMappingFields = (mapping: Record<string, unknown>, index: string): MappingField[] => {
+  const indexMapping =
+    (mapping[index] as { mappings?: { properties?: Record<string, unknown> } } | undefined) ||
+    (Object.values(mapping)[0] as { mappings?: { properties?: Record<string, unknown> } } | undefined)
+  const properties = indexMapping?.mappings?.properties
+
+  if (!properties) {
+    return []
+  }
+
+  const fields: MappingField[] = []
+
+  const visit = (items: Record<string, unknown>, prefix = ''): void => {
+    Object.entries(items).forEach(([name, rawDefinition]) => {
+      if (!rawDefinition || typeof rawDefinition !== 'object' || Array.isArray(rawDefinition)) {
+        return
+      }
+
+      const definition = rawDefinition as {
+        type?: string
+        properties?: Record<string, unknown>
+        fields?: Record<string, { type?: string }>
+      }
+      const path = prefix ? `${prefix}.${name}` : name
+      const type = definition.type || (definition.properties ? 'object' : 'unknown')
+      const keywordSubField = Object.entries(definition.fields || {}).find(([, subField]) =>
+        ['keyword', 'constant_keyword', 'wildcard'].includes(subField.type || '')
+      )?.[0]
+      const aggregatablePath = isDirectlyAggregatableType(type)
+        ? path
+        : keywordSubField
+          ? `${path}.${keywordSubField}`
+          : undefined
+
+      if (type === 'nested') {
+        fields.push({ path, type, input: 'json', metricCapable: false })
+        return
+      }
+
+      if (definition.properties && type === 'object') {
+        visit(definition.properties, path)
+        return
+      }
+
+      fields.push({
+        path,
+        type,
+        input: fieldInputType(type),
+        aggregatablePath,
+        metricCapable: isNumberFieldType(type)
+      })
+    })
+  }
+
+  visit(properties)
+  return fields
+}
+
+const parseMappingFieldValue = (field: MappingField, rawValue: string): unknown => {
+  const trimmed = rawValue.trim()
+  if (!trimmed) {
+    return undefined
+  }
+
+  if (field.input === 'number') {
+    const value = Number(trimmed)
+    if (Number.isNaN(value)) {
+      throw new Error(`${field.path} 需要填写数字`)
+    }
+    return value
+  }
+
+  if (field.input === 'boolean') {
+    if (['true', '1', 'yes', 'y'].includes(trimmed.toLowerCase())) return true
+    if (['false', '0', 'no', 'n'].includes(trimmed.toLowerCase())) return false
+    throw new Error(`${field.path} 需要填写 true/false`)
+  }
+
+  if (field.input === 'json') {
+    try {
+      return JSON.parse(trimmed) as unknown
+    } catch {
+      throw new Error(`${field.path} 需要填写合法 JSON`)
+    }
+  }
+
+  return rawValue
+}
+
+const setNestedDocumentValue = (
+  target: Record<string, unknown>,
+  path: string,
+  value: unknown
+): void => {
+  const parts = path.split('.')
+  let current = target
+
+  parts.forEach((part, index) => {
+    if (index === parts.length - 1) {
+      current[part] = value
+      return
+    }
+
+    if (!current[part] || typeof current[part] !== 'object' || Array.isArray(current[part])) {
+      current[part] = {}
+    }
+
+    current = current[part] as Record<string, unknown>
+  })
+}
+
 function App(): JSX.Element {
   const { message } = AntApp.useApp()
   const [connections, setConnections] = useState<ConnectionProfile[]>([])
@@ -159,6 +536,7 @@ function App(): JSX.Element {
   const [editingConnection, setEditingConnection] = useState<ConnectionProfile | undefined>()
   const [resourceVersion, setResourceVersion] = useState(0)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [indexFilters, setIndexFilters] = useState<Record<string, string>>({})
 
   const loadConnections = async (): Promise<void> => {
     setLoadingConnections(true)
@@ -260,6 +638,13 @@ function App(): JSX.Element {
     setResourceVersion((value) => value + 1)
   }
 
+  const setIndexFilterForConnection = (connectionId: string, value: string): void => {
+    setIndexFilters((current) => ({
+      ...current,
+      [connectionId]: value
+    }))
+  }
+
   return (
     <Layout className="app-shell">
         <Header className="top-bar">
@@ -270,21 +655,13 @@ function App(): JSX.Element {
               <span>Elasticsearch 管理工作台</span>
             </div>
           </div>
-          <Menu
-            className="main-menu"
-            mode="horizontal"
-            selectable={false}
-            items={[
-              { key: 'file', label: '文件' },
-              { key: 'edit', label: '编辑' },
-              { key: 'view', label: '视图' },
-              { key: 'connection', label: '连接' },
-              { key: 'index', label: '索引' },
-              { key: 'tools', label: '工具' },
-              { key: 'help', label: '帮助' }
-            ]}
-          />
           <Space className="toolbar">
+            <Tooltip title={sidebarCollapsed ? '展开资源管理器' : '收起资源管理器'}>
+              <Button
+                icon={sidebarCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+                onClick={() => setSidebarCollapsed((value) => !value)}
+              />
+            </Tooltip>
             <Button
               type="primary"
               icon={<Plus size={16} />}
@@ -379,10 +756,13 @@ function App(): JSX.Element {
               onOpenIndex={(connectionId, index, section = 'data') =>
                 setView({ type: 'index', connectionId, index, section })
               }
+              onBackToIndices={(connectionId) => setView({ type: 'indices', connectionId })}
               onOpenTemplate={(connectionId, name, templateType) =>
                 setView({ type: 'template', connectionId, name, templateType })
               }
               onRefresh={refreshResources}
+              indexFilters={indexFilters}
+              onIndexFilterChange={setIndexFilterForConnection}
             />
           </Content>
         </Layout>
@@ -414,13 +794,16 @@ function Workspace(props: {
   selectedConnection?: ConnectionProfile
   onEditConnection: (connection: ConnectionProfile) => void
   onRemoveConnection: (id: string) => Promise<void>
-  onOpenIndex: (connectionId: string, index: string, section?: 'data' | 'mapping') => void
+  onOpenIndex: (connectionId: string, index: string, section?: IndexSection) => void
+  onBackToIndices: (connectionId: string) => void
   onOpenTemplate: (
     connectionId: string,
     name: string,
     templateType: 'index_template' | 'legacy_template'
   ) => void
   onRefresh: () => void
+  indexFilters: Record<string, string>
+  onIndexFilterChange: (connectionId: string, value: string) => void
 }): JSX.Element {
   const { view } = props
 
@@ -457,6 +840,8 @@ function Workspace(props: {
         connectionId={view.connectionId}
         onOpenIndex={props.onOpenIndex}
         onRefresh={props.onRefresh}
+        indexFilter={props.indexFilters[view.connectionId] || ''}
+        onIndexFilterChange={(value) => props.onIndexFilterChange(view.connectionId, value)}
       />
     )
   }
@@ -467,6 +852,7 @@ function Workspace(props: {
         connectionId={view.connectionId}
         index={view.index}
         section={view.section}
+        onBack={() => props.onBackToIndices(view.connectionId)}
         onRefresh={props.onRefresh}
       />
     )
@@ -775,14 +1161,15 @@ function ClusterPanel(props: { connectionId: string }): JSX.Element {
 
 function IndicesPanel(props: {
   connectionId: string
-  onOpenIndex: (connectionId: string, index: string, section?: 'data' | 'mapping') => void
+  onOpenIndex: (connectionId: string, index: string, section?: IndexSection) => void
   onRefresh: () => void
+  indexFilter: string
+  onIndexFilterChange: (value: string) => void
 }): JSX.Element {
   const { message } = AntApp.useApp()
   const [indices, setIndices] = useState<IndexSummary[]>([])
   const [loading, setLoading] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
-  const [indexFilter, setIndexFilter] = useState('')
 
   const load = async (): Promise<void> => {
     setLoading(true)
@@ -860,7 +1247,7 @@ function IndicesPanel(props: {
   ]
 
   const filteredIndices = useMemo(() => {
-    const keyword = indexFilter.trim().toLowerCase()
+    const keyword = props.indexFilter.trim().toLowerCase()
     if (!keyword) return indices
 
     const pattern = keyword.includes('*')
@@ -871,7 +1258,7 @@ function IndicesPanel(props: {
       const name = item.index.toLowerCase()
       return pattern ? pattern.test(name) : name.includes(keyword)
     })
-  }, [indices, indexFilter])
+  }, [indices, props.indexFilter])
 
   return (
     <section className="panel">
@@ -885,8 +1272,8 @@ function IndicesPanel(props: {
             allowClear
             prefix={<Search size={15} />}
             placeholder="搜索索引名称，支持 * 通配符"
-            value={indexFilter}
-            onChange={(event) => setIndexFilter(event.target.value)}
+            value={props.indexFilter}
+            onChange={(event) => props.onIndexFilterChange(event.target.value)}
             className="index-search"
           />
           <Button icon={<RefreshCw size={16} />} onClick={() => void load()}>
@@ -981,7 +1368,8 @@ function IndexCreateModal(props: {
 function IndexDetailPanel(props: {
   connectionId: string
   index: string
-  section: 'data' | 'mapping'
+  section: IndexSection
+  onBack: () => void
   onRefresh: () => void
 }): JSX.Element {
   const [active, setActive] = useState(props.section)
@@ -995,23 +1383,19 @@ function IndexDetailPanel(props: {
   return (
     <section className="panel">
       <div className="panel-head">
-        <div>
-          <Title level={4}>{props.index}</Title>
-          <Text type="secondary">索引数据和映射管理。</Text>
-        </div>
-        <Space>
-          <Input
-            value={targetIndex}
-            onChange={(event) => setTargetIndex(event.target.value)}
-            placeholder="查询目标索引，例如 index*"
-            className="rename-input"
-          />
-          <Button onClick={() => setTargetIndex(props.index)}>恢复当前索引</Button>
+        <Space align="start">
+          <Tooltip title="返回索引列表">
+            <Button icon={<ChevronLeft size={16} />} onClick={props.onBack} />
+          </Tooltip>
+          <div>
+            <Title level={4}>索引详情</Title>
+            <Text type="secondary">数据查询、映射查看和维护。</Text>
+          </div>
         </Space>
       </div>
       <Tabs
         activeKey={active}
-        onChange={(key) => setActive(key as 'data' | 'mapping')}
+        onChange={(key) => setActive(key as IndexSection)}
         items={[
           {
             key: 'data',
@@ -1021,7 +1405,15 @@ function IndexDetailPanel(props: {
                 数据
               </Space>
             ),
-            children: <DocumentsPanel connectionId={props.connectionId} index={targetIndex.trim() || props.index} />
+            children: (
+              <DocumentsPanel
+                connectionId={props.connectionId}
+                index={targetIndex.trim() || props.index}
+                baseIndex={props.index}
+                targetIndex={targetIndex}
+                onTargetIndexChange={setTargetIndex}
+              />
+            )
           },
           {
             key: 'mapping',
@@ -1031,7 +1423,34 @@ function IndexDetailPanel(props: {
                 映射
               </Space>
             ),
-            children: <MappingPanel connectionId={props.connectionId} index={targetIndex.trim() || props.index} onRefresh={props.onRefresh} />
+            children: (
+              <MappingPanel
+                connectionId={props.connectionId}
+                index={targetIndex.trim() || props.index}
+                baseIndex={props.index}
+                targetIndex={targetIndex}
+                onTargetIndexChange={setTargetIndex}
+                onRefresh={props.onRefresh}
+              />
+            )
+          },
+          {
+            key: 'aggregation',
+            label: (
+              <Space size={6}>
+                <ChartColumn size={15} />
+                聚合
+              </Space>
+            ),
+            children: (
+              <AggregationPanel
+                connectionId={props.connectionId}
+                index={targetIndex.trim() || props.index}
+                baseIndex={props.index}
+                targetIndex={targetIndex}
+                onTargetIndexChange={setTargetIndex}
+              />
+            )
           }
         ]}
       />
@@ -1039,14 +1458,25 @@ function IndexDetailPanel(props: {
   )
 }
 
-function DocumentsPanel(props: { connectionId: string; index: string }): JSX.Element {
+function DocumentsPanel(props: {
+  connectionId: string
+  index: string
+  baseIndex: string
+  targetIndex: string
+  onTargetIndexChange: (value: string) => void
+}): JSX.Element {
   const { message } = AntApp.useApp()
-  const [queryMode, setQueryMode] = useState<'condition' | 'dsl'>('condition')
-  const [queryText, setQueryText] = useState(DEFAULT_CONDITION_QUERY)
-  const [pageSize, setPageSize] = useState(50)
+  const { queryMode, setQueryMode, queryText, dslText, handleQueryTextChange, setQueryState, resetQuery } = useSyncedQueryState()
+  const presetKey = storageKey('query-presets', props.connectionId, props.index)
+  const preferenceKey = storageKey('document-preference', props.connectionId, props.index)
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
   const [from, setFrom] = useState(0)
   const [result, setResult] = useState<DocumentSearchResult>({ rows: [], total: 0 })
   const [loading, setLoading] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  const [operationProgress, setOperationProgress] = useState<OperationProgress>()
+  const [activeOperationId, setActiveOperationId] = useState<string>()
   const [editingCell, setEditingCell] = useState<EditableCell>()
   const [editingValue, setEditingValue] = useState('')
   const [savingCell, setSavingCell] = useState(false)
@@ -1054,6 +1484,20 @@ function DocumentsPanel(props: { connectionId: string; index: string }): JSX.Ele
   const [detailText, setDetailText] = useState('')
   const [savingDetail, setSavingDetail] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
+  const [sortField, setSortField] = useState<string>()
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc')
+  const [visibleFields, setVisibleFields] = useState<string[]>([])
+  const [queryPresets, setQueryPresets] = useState<QueryPreset[]>([])
+  const [presetName, setPresetName] = useState('')
+  const [loadedPreferenceKey, setLoadedPreferenceKey] = useState('')
+  const [pendingImport, setPendingImport] = useState<PendingImportFile>()
+  const [importTargetMode, setImportTargetMode] = useState<ImportTargetMode>('existing')
+  const [importTargetIndex, setImportTargetIndex] = useState(props.index)
+
+  const effectiveQueryText = useMemo(
+    () => buildQueryTextWithSort(sortField ? dslText : queryText, sortField, sortOrder),
+    [dslText, queryText, sortField, sortOrder]
+  )
 
   const load = async (nextFrom = from): Promise<void> => {
     setLoading(true)
@@ -1062,7 +1506,7 @@ function DocumentsPanel(props: { connectionId: string; index: string }): JSX.Ele
         api.documents.search({
           connectionId: props.connectionId,
           index: props.index,
-          queryText,
+          queryText: effectiveQueryText,
           size: pageSize,
           from: nextFrom
         })
@@ -1080,8 +1524,365 @@ function DocumentsPanel(props: { connectionId: string; index: string }): JSX.Ele
   }
 
   useEffect(() => {
+    const preference = readStorageJson<DocumentViewPreference | undefined>(preferenceKey, undefined)
+    setVisibleFields(preference?.visibleFields || [])
+    setSortField(preference?.sortField)
+    setSortOrder(preference?.sortOrder || 'desc')
+    setPageSize(preference?.pageSize || DEFAULT_PAGE_SIZE)
+    setQueryPresets(readStorageJson<QueryPreset[]>(presetKey, []))
+    setLoadedPreferenceKey(preferenceKey)
     void load(0)
   }, [props.connectionId, props.index])
+
+  useEffect(() => {
+    if (loadedPreferenceKey !== preferenceKey) {
+      return
+    }
+
+    writeStorageJson(preferenceKey, {
+      visibleFields,
+      sortField,
+      sortOrder,
+      pageSize
+    } satisfies DocumentViewPreference)
+  }, [loadedPreferenceKey, preferenceKey, visibleFields, sortField, sortOrder, pageSize])
+
+  useEffect(() => {
+    void load(0)
+  }, [sortField, sortOrder])
+
+  useEffect(() => {
+    if (!api?.progress) {
+      return undefined
+    }
+
+    return api.progress.onOperationProgress((progress) => {
+      setOperationProgress((current) =>
+        progress.operationId === activeOperationId || progress.operationId === current?.operationId
+          ? progress
+          : current
+      )
+    })
+  }, [activeOperationId])
+
+  const exportFileName = (): string => {
+    const safeIndex = props.index.replace(/[^a-zA-Z0-9._-]+/g, '_') || 'documents'
+    return `${safeIndex}-documents-${new Date().toISOString().slice(0, 10)}.json`
+  }
+
+  const saveQueryPreset = (): void => {
+    const name = presetName.trim()
+    if (!name) {
+      message.warning('请输入查询方案名称')
+      return
+    }
+
+    const nextPreset: QueryPreset = {
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      name,
+      mode: queryMode,
+      text: queryText,
+      sortField,
+      sortOrder,
+      updatedAt: new Date().toISOString()
+    }
+    const nextPresets = [nextPreset, ...queryPresets.filter((preset) => preset.name !== name)].slice(0, 20)
+    setQueryPresets(nextPresets)
+    writeStorageJson(presetKey, nextPresets)
+    setPresetName('')
+    message.success(`查询方案已保存：${name}`)
+  }
+
+  const loadQueryPreset = (presetId: string): void => {
+    const preset = queryPresets.find((item) => item.id === presetId)
+    if (!preset) {
+      return
+    }
+
+    setQueryState(preset.mode, preset.text)
+    setSortField(preset.sortField)
+    setSortOrder(preset.sortOrder)
+    message.success(`已加载查询方案：${preset.name}`)
+  }
+
+  const deleteQueryPreset = (presetId: string): void => {
+    const nextPresets = queryPresets.filter((preset) => preset.id !== presetId)
+    setQueryPresets(nextPresets)
+    writeStorageJson(presetKey, nextPresets)
+    message.success('查询方案已删除')
+  }
+
+  const exportCurrentPage = async (): Promise<void> => {
+    if (!api) {
+      message.error('客户端接口未加载，请重启应用')
+      return
+    }
+
+    const operationId = createOperationId('export-page')
+    setActiveOperationId(operationId)
+    setExporting(true)
+    setOperationProgress({
+      operationId,
+      type: 'export',
+      phase: 'serializing',
+      current: 0,
+      total: 1,
+      percent: 0,
+      message: '正在生成当前页导出内容'
+    })
+    try {
+      const mappingResponse = await callApi(() =>
+        api.indices.mapping({
+          connectionId: props.connectionId,
+          index: props.index
+        })
+      )
+      if (!mappingResponse.ok) {
+        message.error(resultMessage(mappingResponse.error))
+        return
+      }
+      const payload: DocumentExportPayload = {
+        index: props.index,
+        exportedAt: new Date().toISOString(),
+        total: result.total,
+        exported: result.rows.length,
+        from,
+        size: pageSize,
+        mappings: mappingResponse.data,
+        documents: result.rows.map((row) => ({
+          id: row._id,
+          index: row._index,
+          document: row._source
+        }))
+      }
+      const content = JSON.stringify(payload, null, 2)
+      setOperationProgress({
+        operationId,
+        type: 'export',
+        phase: 'saving',
+        current: 1,
+        total: 1,
+        percent: 90,
+        message: '请选择导出保存位置'
+      })
+      const saved = await api.files.saveJson({ defaultFileName: exportFileName(), content })
+      if (!saved.canceled) {
+        setOperationProgress({
+          operationId,
+          type: 'export',
+          phase: 'done',
+          current: 1,
+          total: 1,
+          percent: 100,
+          message: `当前页已导出到 ${saved.filePath}`
+        })
+        Modal.success({
+          title: '导出完成',
+          content: (
+            <Space direction="vertical">
+              <Text>导出数量：{result.rows.length} 条</Text>
+              <Text>已包含索引 mapping</Text>
+              <Text>文件路径：{saved.filePath}</Text>
+            </Space>
+          )
+        })
+      }
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const exportAllMatches = async (): Promise<void> => {
+    if (!api) {
+      message.error('客户端接口未加载，请重启应用')
+      return
+    }
+
+    const operationId = createOperationId('export-all')
+    setActiveOperationId(operationId)
+    setOperationProgress({
+      operationId,
+      type: 'export',
+      phase: 'starting',
+      current: 0,
+      percent: 0,
+      message: '准备导出查询结果'
+    })
+    setExporting(true)
+    try {
+      const response = await callApi(() =>
+        api.documents.export({
+          connectionId: props.connectionId,
+          index: props.index,
+          queryText: effectiveQueryText,
+          operationId
+        })
+      )
+      if (!response.ok) {
+        message.error(resultMessage(response.error))
+        return
+      }
+
+      const saved = await api.files.saveJson({ defaultFileName: exportFileName(), content: response.data })
+      if (!saved.canceled) {
+        const parsed = JSON.parse(response.data) as { exported?: number; total?: number; truncated?: boolean }
+        setOperationProgress({
+          operationId,
+          type: 'export',
+          phase: 'done',
+          current: parsed.exported || 0,
+          total: parsed.exported || 0,
+          percent: 100,
+          message: `查询结果已导出到 ${saved.filePath}`
+        })
+        Modal.success({
+          title: '导出完成',
+          content: (
+            <Space direction="vertical">
+              <Text>导出索引：{props.index}</Text>
+              <Text>导出数量：{parsed.exported || 0} / {parsed.total || 0} 条</Text>
+              <Text>已包含索引 mapping</Text>
+              {parsed.truncated && <Text type="warning">数据量超过上限，本次最多导出 100000 条。</Text>}
+              <Text>文件路径：{saved.filePath}</Text>
+            </Space>
+          )
+        })
+      }
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const importDocuments = async (): Promise<void> => {
+    if (!api) {
+      message.error('客户端接口未加载，请重启应用')
+      return
+    }
+
+    const operationId = createOperationId('import')
+    setActiveOperationId(operationId)
+    setOperationProgress({
+      operationId,
+      type: 'import',
+      phase: 'opening',
+      current: 0,
+      percent: 0,
+      message: '请选择导入文件'
+    })
+    setImporting(true)
+    try {
+      const opened = await api.files.openJson()
+      if (opened.canceled || !opened.content) {
+        return
+      }
+      const preview = inspectImportContent(opened.content)
+      setPendingImport({
+        content: opened.content,
+        filePath: opened.filePath,
+        preview
+      })
+      setImportTargetMode('existing')
+      setImportTargetIndex(hasIndexWildcard(props.index) ? props.baseIndex : props.index)
+      setOperationProgress({
+        operationId,
+        type: 'import',
+        phase: 'uploading',
+        current: 0,
+        percent: 0,
+        message: `已读取 ${opened.filePath || '导入文件'}，请选择导入方式`
+      })
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  const confirmImportDocuments = async (): Promise<void> => {
+    if (!api || !pendingImport) {
+      return
+    }
+
+    const targetIndex = importTargetIndex.trim()
+    if (!targetIndex) {
+      message.warning('请输入目标索引')
+      return
+    }
+
+    if (hasIndexWildcard(targetIndex)) {
+      message.warning('导入目标必须是单个索引，不能包含通配符或多个索引')
+      return
+    }
+
+    if (importTargetMode === 'create' && !pendingImport.preview.mappings) {
+      message.warning('导入文件没有 mapping，无法按导出 mapping 新建索引')
+      return
+    }
+
+    const operationId = createOperationId('import')
+    setActiveOperationId(operationId)
+    setImporting(true)
+    setOperationProgress({
+      operationId,
+      type: 'import',
+      phase: importTargetMode === 'create' ? 'creating-index' : 'starting',
+      current: 0,
+      percent: 0,
+      message:
+        importTargetMode === 'create'
+          ? `准备创建索引 ${targetIndex} 并导入数据`
+          : `准备导入数据到已有索引 ${targetIndex}`
+    })
+    try {
+      const response = await callApi(() =>
+        api.documents.import({
+          connectionId: props.connectionId,
+          index: props.index,
+          targetIndex,
+          mode: importTargetMode,
+          content: pendingImport.content,
+          refresh: true,
+          operationId
+        })
+      )
+
+      if (response.ok) {
+        const targetText = response.data.targetIndices.join(', ') || props.index
+        setOperationProgress({
+          operationId,
+          type: 'import',
+          phase: 'done',
+          current: response.data.imported + response.data.failed,
+          total: response.data.imported + response.data.failed,
+          percent: 100,
+          message: `导入完成：成功 ${response.data.imported} 条，失败 ${response.data.failed} 条`
+        })
+        Modal.success({
+          title: '导入完成',
+          content: (
+            <Space direction="vertical">
+              <Text>目标索引：{targetText}</Text>
+              <Text>导入方式：{response.data.targetMode === 'create' ? '新建索引并使用导出 mapping' : '导入到已有索引，复用已有 mapping'}</Text>
+              {response.data.indexCreated && <Text>已创建索引：{targetText}</Text>}
+              <Text>成功导入：{response.data.imported} 条</Text>
+              <Text>失败：{response.data.failed} 条</Text>
+              <Text>写入策略：有文档 ID 的记录按 ES index 语义写入，同 ID 会覆盖；无 ID 的记录由 ES 自动生成 ID，为新增。</Text>
+              <Text>本次有 ID 写入/可能覆盖：{response.data.overwritten} 条</Text>
+              <Text>无 ID 新增：{response.data.created} 条</Text>
+            </Space>
+          )
+        })
+        setPendingImport(undefined)
+        if (targetIndex !== props.index) {
+          props.onTargetIndexChange(targetIndex)
+        } else {
+          await load(0)
+        }
+      } else {
+        message.error(resultMessage(response.error))
+      }
+    } finally {
+      setImporting(false)
+    }
+  }
 
   const fields = useMemo(() => {
     const fieldSet = new Set<string>()
@@ -1089,10 +1890,23 @@ function DocumentsPanel(props: { connectionId: string; index: string }): JSX.Ele
     return Array.from(fieldSet).slice(0, 80)
   }, [result.rows])
 
+  useEffect(() => {
+    setVisibleFields((current) => current.filter((field) => fields.includes(field)))
+    setSortField((current) => (current && fields.includes(current) ? current : undefined))
+  }, [fields])
+
+  const selectedFields = visibleFields.length ? visibleFields : fields
+  const fieldOptions = fields.map((field) => ({ value: field, label: field }))
+  const sortOptions = [
+    { value: '_score', label: '_score' },
+    { value: '_id', label: '_id' },
+    ...fieldOptions
+  ]
+
   const columns: ColumnsType<DocumentRow> = [
     { title: '_id', dataIndex: '_id', width: 260, fixed: 'left' },
     { title: '_index', dataIndex: '_index', width: 180 },
-    ...fields.map((field) => ({
+    ...selectedFields.map((field) => ({
       title: field,
       dataIndex: ['_source', field],
       width: 180,
@@ -1172,9 +1986,7 @@ function DocumentsPanel(props: { connectionId: string; index: string }): JSX.Ele
                   size="small"
                   value={queryMode}
                   onChange={(event) => {
-                    const mode = event.target.value as 'condition' | 'dsl'
-                    setQueryMode(mode)
-                    setQueryText(mode === 'condition' ? DEFAULT_CONDITION_QUERY : DEFAULT_QUERY)
+                    setQueryMode(event.target.value as QueryMode)
                   }}
                   options={[
                     { label: '条件', value: 'condition' },
@@ -1183,16 +1995,27 @@ function DocumentsPanel(props: { connectionId: string; index: string }): JSX.Ele
                 />
                 <Button
                   size="small"
-                  onClick={() => setQueryText(queryMode === 'condition' ? DEFAULT_CONDITION_QUERY : DEFAULT_QUERY)}
+                  onClick={resetQuery}
                 >
                   重置
                 </Button>
               </Space>
             </div>
+            <Space direction="vertical" size={6} className="full-width query-index-row">
+              <Text type="secondary">目标索引</Text>
+              <Space.Compact className="full-width">
+                <Input
+                  value={props.targetIndex}
+                  onChange={(event) => props.onTargetIndexChange(event.target.value)}
+                  placeholder="查询目标索引，例如 index*"
+                />
+                <Button onClick={() => props.onTargetIndexChange(props.baseIndex)}>恢复</Button>
+              </Space.Compact>
+            </Space>
             <Input.TextArea
               value={queryText}
               rows={queryMode === 'condition' ? 5 : 16}
-              onChange={(event) => setQueryText(event.target.value)}
+              onChange={(event) => handleQueryTextChange(event.target.value)}
               placeholder={
                 queryMode === 'condition'
                   ? '例如：age >= 18 and active = true\nname like 张\nstatus in (1,2,3) or city != 北京'
@@ -1206,6 +2029,45 @@ function DocumentsPanel(props: { connectionId: string; index: string }): JSX.Ele
                 查询
               </Button>
             </Space>
+            <div className="query-presets">
+              <Text type="secondary">常用查询</Text>
+              <Space.Compact className="full-width">
+                <Input
+                  value={presetName}
+                  onChange={(event) => setPresetName(event.target.value)}
+                  placeholder="方案名称"
+                />
+                <Button onClick={saveQueryPreset}>保存</Button>
+              </Space.Compact>
+              <Select
+                allowClear
+                className="full-width"
+                placeholder="加载查询方案"
+                value={undefined}
+                onChange={loadQueryPreset}
+                options={queryPresets.map((preset) => ({
+                  value: preset.id,
+                  label: `${preset.name}${preset.sortField ? ` · ${preset.sortField} ${preset.sortOrder}` : ''}`
+                }))}
+                notFoundContent="暂无查询方案"
+              />
+              {queryPresets.length > 0 && (
+                <Space wrap size={[6, 6]}>
+                  {queryPresets.slice(0, 6).map((preset) => (
+                    <Tag
+                      key={preset.id}
+                      closable
+                      onClose={(event) => {
+                        event.preventDefault()
+                        deleteQueryPreset(preset.id)
+                      }}
+                    >
+                      {preset.name}
+                    </Tag>
+                  ))}
+                </Space>
+              )}
+            </div>
             <Alert
               type="info"
               showIcon
@@ -1222,27 +2084,80 @@ function DocumentsPanel(props: { connectionId: string; index: string }): JSX.Ele
                 <Badge count={result.total} overflowCount={99999999} showZero color="#1677ff" />
                 {typeof result.took === 'number' && <Tag>耗时 {result.took} ms</Tag>}
               </Space>
-              <Space>
+              <Space className="table-actions" wrap>
+                <Select
+                  mode="multiple"
+                  allowClear
+                  maxTagCount="responsive"
+                  className="field-filter"
+                  placeholder="展示字段"
+                  value={visibleFields}
+                  onChange={setVisibleFields}
+                  options={fieldOptions}
+                />
+                <Select
+                  allowClear
+                  showSearch
+                  className="sort-field"
+                  placeholder="排序字段"
+                  value={sortField}
+                  onChange={setSortField}
+                  options={sortOptions}
+                />
+                <Radio.Group
+                  size="small"
+                  value={sortOrder}
+                  onChange={(event) => setSortOrder(event.target.value as 'asc' | 'desc')}
+                  options={[
+                    { label: '升序', value: 'asc' },
+                    { label: '降序', value: 'desc' }
+                  ]}
+                />
                 <Button icon={<RefreshCw size={16} />} onClick={() => void load(from)}>
                   刷新数据
+                </Button>
+                <Button icon={<Upload size={16} />} loading={importing} onClick={() => void importDocuments()}>
+                  导入
+                </Button>
+                <Button icon={<Download size={16} />} loading={exporting} onClick={() => void exportCurrentPage()}>
+                  导出当前页
+                </Button>
+                <Button loading={exporting} onClick={() => void exportAllMatches()}>
+                  导出查询结果
                 </Button>
                 <Button type="primary" icon={<Plus size={16} />} onClick={() => setCreateOpen(true)}>
                   新增文档
                 </Button>
               </Space>
             </div>
+            {operationProgress && (
+              <div className="operation-progress">
+                <Space direction="vertical" size={6} className="full-width">
+                  <Space>
+                    <Text strong>{operationProgress.type === 'import' ? '导入进度' : '导出进度'}</Text>
+                    <Tag>{operationProgress.phase}</Tag>
+                  </Space>
+                  <Progress
+                    percent={operationProgress.percent}
+                    status={operationProgress.phase === 'error' ? 'exception' : operationProgress.phase === 'done' ? 'success' : 'active'}
+                  />
+                  <Text type="secondary">{operationProgress.message}</Text>
+                </Space>
+              </div>
+            )}
             <Table
               rowKey="_id"
               loading={loading}
               columns={columns}
               dataSource={result.rows}
               size="small"
-              scroll={{ x: Math.max(900, fields.length * 180 + 440), y: 'calc(100vh - 360px)' }}
+              scroll={{ x: Math.max(900, selectedFields.length * 180 + 440), y: 'calc(100vh - 380px)' }}
               pagination={{
                 current: Math.floor(from / pageSize) + 1,
                 pageSize,
                 total: result.total,
                 showSizeChanger: false,
+                showTotal: (total, range) => `${range[0]}-${range[1]} / ${total} 条`,
                 onChange: (page) => void load((page - 1) * pageSize)
               }}
             />
@@ -1311,6 +2226,70 @@ function DocumentsPanel(props: { connectionId: string; index: string }): JSX.Ele
         }}
       />
       <Modal
+        title="导入文档"
+        open={Boolean(pendingImport)}
+        onCancel={() => {
+          if (!importing) {
+            setPendingImport(undefined)
+          }
+        }}
+        onOk={() => void confirmImportDocuments()}
+        okText="开始导入"
+        cancelText="取消"
+        confirmLoading={importing}
+        width={720}
+      >
+        <Space direction="vertical" size={12} className="full-width">
+          <Alert
+            type={pendingImport?.preview.mappings ? 'info' : 'warning'}
+            showIcon
+            message={
+              pendingImport?.preview.mappings
+                ? '导入文件包含索引 mapping，可用于新建索引'
+                : '导入文件未包含 mapping，只能导入到已有索引'
+            }
+            description="导入时会把所有文档写入你选择的目标索引，不会自动沿用文件中的原索引。"
+          />
+          <Descriptions column={1} size="small" bordered>
+            <Descriptions.Item label="文件">{pendingImport?.filePath || '已选择文件'}</Descriptions.Item>
+            <Descriptions.Item label="导出索引">{pendingImport?.preview.index || '未识别'}</Descriptions.Item>
+            <Descriptions.Item label="文档数量">{pendingImport?.preview.documentCount || 0} 条</Descriptions.Item>
+            <Descriptions.Item label="Mapping">
+              {pendingImport?.preview.mappings ? '已包含' : '未包含'}
+            </Descriptions.Item>
+          </Descriptions>
+          <Radio.Group
+            value={importTargetMode}
+            onChange={(event) => {
+              const nextMode = event.target.value as ImportTargetMode
+              setImportTargetMode(nextMode)
+              setImportTargetIndex(
+                nextMode === 'create'
+                  ? suggestedImportIndex(pendingImport?.preview.index || props.baseIndex || props.index)
+                  : hasIndexWildcard(props.index) ? props.baseIndex : props.index
+              )
+            }}
+            options={[
+              { label: '导入到已有索引', value: 'existing' },
+              { label: '新建索引并使用导出 mapping', value: 'create', disabled: !pendingImport?.preview.mappings }
+            ]}
+          />
+          <Space direction="vertical" size={6} className="full-width">
+            <Text type="secondary">{importTargetMode === 'create' ? '新索引名称' : '已有索引名称'}</Text>
+            <Input
+              value={importTargetIndex}
+              onChange={(event) => setImportTargetIndex(event.target.value)}
+              placeholder={importTargetMode === 'create' ? '例如：orders_copy' : '例如：orders'}
+            />
+            <Text type="secondary">
+              {importTargetMode === 'create'
+                ? '会先创建这个索引并应用导出文件中的 mapping，然后导入数据。'
+                : '会复用已有索引和 mapping，只导入文档数据。'}
+            </Text>
+          </Space>
+        </Space>
+      </Modal>
+      <Modal
         title={`文档详情：${detailRow?._id || ''}`}
         open={Boolean(detailRow)}
         onCancel={() => setDetailRow(undefined)}
@@ -1357,6 +2336,288 @@ function DocumentsPanel(props: { connectionId: string; index: string }): JSX.Ele
   )
 }
 
+function AggregationPanel(props: {
+  connectionId: string
+  index: string
+  baseIndex: string
+  targetIndex: string
+  onTargetIndexChange: (value: string) => void
+}): JSX.Element {
+  const { message } = AntApp.useApp()
+  const { queryMode, setQueryMode, queryText, handleQueryTextChange, resetQuery } = useSyncedQueryState()
+  const [fields, setFields] = useState<MappingField[]>([])
+  const [loadingFields, setLoadingFields] = useState(false)
+  const [groupFields, setGroupFields] = useState<string[]>([])
+  const [metric, setMetric] = useState<AggregationMetric>('count')
+  const [metricField, setMetricField] = useState<string>()
+  const [size, setSize] = useState(100)
+  const [loading, setLoading] = useState(false)
+  const [result, setResult] = useState<DocumentAggregationResult>()
+
+  const groupOptions = useMemo(
+    () =>
+      fields
+        .filter((field) => field.aggregatablePath)
+        .map((field) => ({
+          value: field.aggregatablePath || field.path,
+          label:
+            field.aggregatablePath && field.aggregatablePath !== field.path
+              ? `${field.path} (${field.aggregatablePath})`
+              : `${field.path} (${field.type})`
+        })),
+    [fields]
+  )
+  const metricOptions = useMemo(
+    () =>
+      fields
+        .filter((field) => field.metricCapable)
+        .map((field) => ({
+          value: field.path,
+          label: `${field.path} (${field.type})`
+        })),
+    [fields]
+  )
+
+  const loadFields = async (): Promise<void> => {
+    if (hasIndexWildcard(props.index)) {
+      setFields([])
+      setGroupFields([])
+      setMetricField(undefined)
+      return
+    }
+
+    setLoadingFields(true)
+    try {
+      const response = await callApi(() =>
+        api.indices.mapping({ connectionId: props.connectionId, index: props.index })
+      )
+      if (response.ok) {
+        const nextFields = extractMappingFields(response.data, props.index)
+        const firstGroupField = nextFields.find((field) => field.aggregatablePath)?.aggregatablePath
+        setFields(nextFields)
+        setGroupFields((current) =>
+          current.length && current.every((selected) => nextFields.some((field) => field.aggregatablePath === selected))
+            ? current
+            : firstGroupField
+              ? [firstGroupField]
+              : []
+        )
+        setMetricField((current) =>
+          current && nextFields.some((field) => field.path === current && field.metricCapable)
+            ? current
+            : nextFields.find((field) => field.metricCapable)?.path
+        )
+      } else {
+        message.error(resultMessage(response.error))
+      }
+    } finally {
+      setLoadingFields(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadFields()
+    setResult(undefined)
+  }, [props.connectionId, props.index])
+
+  const runAggregation = async (): Promise<void> => {
+    if (!groupFields.length) {
+      message.error('请选择分组字段')
+      return
+    }
+
+    if (metric !== 'count' && !metricField) {
+      message.error('请选择指标字段')
+      return
+    }
+
+    setLoading(true)
+    try {
+      const response = await callApi(() =>
+        api.documents.aggregate({
+          connectionId: props.connectionId,
+          index: props.index,
+          queryText,
+          groupFields,
+          metric,
+          metricField: metric === 'count' ? undefined : metricField,
+          size
+        })
+      )
+
+      if (response.ok) {
+        setResult(response.data)
+      } else {
+        message.error(resultMessage(response.error))
+      }
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const columns: ColumnsType<DocumentAggregationResult['buckets'][number]> = [
+    ...(result?.groupFields.length ? result.groupFields : groupFields).map((field, index) => ({
+      title: field,
+      key: `group-${field}-${index}`,
+      width: 180,
+      render: (_: unknown, row: DocumentAggregationResult['buckets'][number]) => {
+        const value = row.keys[index]
+        return value === null ? <Text type="secondary">空值</Text> : String(value ?? '')
+      }
+    })),
+    {
+      title: '文档数',
+      dataIndex: 'count',
+      width: 140,
+      sorter: (a, b) => a.count - b.count
+    }
+  ]
+
+  if (metric !== 'count') {
+    columns.push({
+      title: `${metric.toUpperCase()}(${metricField || '-'})`,
+      dataIndex: 'value',
+      width: 180,
+      sorter: (a, b) => (a.value || 0) - (b.value || 0),
+      render: (value?: number | null) => (typeof value === 'number' ? Number(value.toFixed(6)) : '-')
+    })
+  }
+
+  return (
+    <div className="sub-panel">
+      <Splitter>
+        <Splitter.Panel defaultSize={360} min={300} max={520}>
+          <div className="query-pane">
+            <div className="sub-head">
+              <Text strong>聚合条件</Text>
+              <Space>
+                <Radio.Group
+                  size="small"
+                  value={queryMode}
+                  onChange={(event) => {
+                    setQueryMode(event.target.value as QueryMode)
+                  }}
+                  options={[
+                    { label: '条件', value: 'condition' },
+                    { label: 'DSL', value: 'dsl' }
+                  ]}
+                />
+                <Button
+                  size="small"
+                  onClick={resetQuery}
+                >
+                  重置
+                </Button>
+              </Space>
+            </div>
+            <Space direction="vertical" size={12} className="full-width">
+              <Space direction="vertical" size={6} className="full-width">
+                <Text type="secondary">目标索引</Text>
+                <Space.Compact className="full-width">
+                  <Input
+                    value={props.targetIndex}
+                    onChange={(event) => props.onTargetIndexChange(event.target.value)}
+                    placeholder="查询目标索引，例如 index*"
+                  />
+                  <Button onClick={() => props.onTargetIndexChange(props.baseIndex)}>恢复</Button>
+                </Space.Compact>
+              </Space>
+              <Input.TextArea
+                value={queryText}
+                rows={queryMode === 'condition' ? 5 : 12}
+                onChange={(event) => handleQueryTextChange(event.target.value)}
+                placeholder={
+                  queryMode === 'condition'
+                    ? '例如：age >= 18 and active = true'
+                    : DEFAULT_QUERY
+                }
+                className="code-textarea"
+              />
+              <Spin spinning={loadingFields}>
+                <Space direction="vertical" size={10} className="full-width aggregation-form">
+                  <div>
+                    <Text type="secondary">分组字段</Text>
+                    <Select
+                      mode={hasIndexWildcard(props.index) ? 'tags' : 'multiple'}
+                      showSearch
+                      maxTagCount="responsive"
+                      className="full-width"
+                      placeholder={hasIndexWildcard(props.index) ? '通配索引请手动输入多个字段' : '选择一个或多个分组字段'}
+                      value={groupFields}
+                      onChange={(value) => setGroupFields(value.slice(0, 5))}
+                      options={groupOptions}
+                      notFoundContent={hasIndexWildcard(props.index) ? '输入字段名后回车' : '没有可聚合字段'}
+                    />
+                  </div>
+                  <div>
+                    <Text type="secondary">指标</Text>
+                    <Select
+                      className="full-width"
+                      value={metric}
+                      onChange={(value) => setMetric(value)}
+                      options={[
+                        { value: 'count', label: 'count 文档数' },
+                        { value: 'sum', label: 'sum 求和' },
+                        { value: 'avg', label: 'avg 平均值' },
+                        { value: 'min', label: 'min 最小值' },
+                        { value: 'max', label: 'max 最大值' }
+                      ]}
+                    />
+                  </div>
+                  {metric !== 'count' && (
+                    <div>
+                      <Text type="secondary">指标字段</Text>
+                      <Select
+                        mode={hasIndexWildcard(props.index) ? 'combobox' : undefined}
+                        showSearch
+                        className="full-width"
+                        placeholder={hasIndexWildcard(props.index) ? '通配索引请手动输入数值字段' : '选择数值字段'}
+                        value={metricField}
+                        onChange={setMetricField}
+                        options={metricOptions}
+                        notFoundContent="没有数值字段"
+                      />
+                    </div>
+                  )}
+                  <Space className="query-actions">
+                    <InputNumber min={1} max={1000} value={size} onChange={(value) => setSize(value || 100)} />
+                    <Button type="primary" icon={<ChartColumn size={16} />} loading={loading} onClick={() => void runAggregation()}>
+                      运行聚合
+                    </Button>
+                  </Space>
+                </Space>
+              </Spin>
+            </Space>
+          </div>
+        </Splitter.Panel>
+        <Splitter.Panel>
+          <div className="table-pane">
+            <div className="sub-head">
+              <Space>
+                <Text strong>聚合结果</Text>
+                {result && <Badge count={result.buckets.length} overflowCount={9999} showZero color="#1677ff" />}
+                {result && <Tag>命中 {result.total} 条</Tag>}
+                {typeof result?.took === 'number' && <Tag>耗时 {result.took} ms</Tag>}
+              </Space>
+              <Button icon={<RefreshCw size={16} />} loading={loading} onClick={() => void runAggregation()}>
+                刷新聚合
+              </Button>
+            </div>
+            <Table
+              rowKey={(row) => JSON.stringify(row.keys)}
+              loading={loading}
+              columns={columns}
+              dataSource={result?.buckets || []}
+              size="small"
+              pagination={{ pageSize: 20, showSizeChanger: true }}
+            />
+          </div>
+        </Splitter.Panel>
+      </Splitter>
+    </div>
+  )
+}
+
 function DocumentCreateModal(props: {
   open: boolean
   connectionId: string
@@ -1367,7 +2628,63 @@ function DocumentCreateModal(props: {
   const { message } = AntApp.useApp()
   const [id, setId] = useState('')
   const [body, setBody] = useState('{\n  "name": "示例文档"\n}')
+  const [fields, setFields] = useState<MappingField[]>([])
+  const [fieldValues, setFieldValues] = useState<Record<string, string>>({})
+  const [loadingFields, setLoadingFields] = useState(false)
   const [saving, setSaving] = useState(false)
+  const useFieldForm = fields.length > 0 && !hasIndexWildcard(props.index)
+
+  useEffect(() => {
+    if (!props.open) {
+      return
+    }
+
+    setId('')
+    setBody('{\n  "name": "示例文档"\n}')
+    setFields([])
+    setFieldValues({})
+
+    if (hasIndexWildcard(props.index)) {
+      return
+    }
+
+    const loadFields = async (): Promise<void> => {
+      setLoadingFields(true)
+      try {
+        const response = await callApi(() =>
+          api.indices.mapping({ connectionId: props.connectionId, index: props.index })
+        )
+        if (response.ok) {
+          const nextFields = extractMappingFields(response.data, props.index)
+          setFields(nextFields)
+          setFieldValues(
+            Object.fromEntries(
+              nextFields.map((field) => [field.path, field.input === 'json' ? '' : ''])
+            )
+          )
+        } else {
+          message.warning(`读取字段失败，将使用 JSON 输入：${resultMessage(response.error)}`)
+        }
+      } finally {
+        setLoadingFields(false)
+      }
+    }
+
+    void loadFields()
+  }, [props.open, props.connectionId, props.index, message])
+
+  const buildDocumentFromFields = (): Record<string, unknown> => {
+    const document: Record<string, unknown> = {}
+
+    fields.forEach((field) => {
+      const value = parseMappingFieldValue(field, fieldValues[field.path] || '')
+      if (value !== undefined) {
+        setNestedDocumentValue(document, field.path, value)
+      }
+    })
+
+    return document
+  }
 
   return (
     <Modal
@@ -1381,13 +2698,18 @@ function DocumentCreateModal(props: {
       onOk={async () => {
         setSaving(true)
         try {
-            const response = await callApi(() =>
-              api.documents.create({
-                connectionId: props.connectionId,
-                index: props.index,
-                id,
-                document: parseJson(body),
-                refresh: true
+          const document = useFieldForm ? buildDocumentFromFields() : parseJson(body)
+          if (!Object.keys(document).length) {
+            throw new Error('请至少填写一个字段值')
+          }
+
+          const response = await callApi(() =>
+            api.documents.create({
+              connectionId: props.connectionId,
+              index: props.index,
+              id,
+              document,
+              refresh: true
             })
           )
           if (response.ok) {
@@ -1405,18 +2727,82 @@ function DocumentCreateModal(props: {
     >
       <Space direction="vertical" className="full-width">
         <Input value={id} onChange={(event) => setId(event.target.value)} placeholder="文档 ID（可选）" />
-        <Input.TextArea
-          value={body}
-          rows={14}
-          onChange={(event) => setBody(event.target.value)}
-          className="code-textarea"
-        />
+        {useFieldForm ? (
+          <Spin spinning={loadingFields}>
+            <div className="document-create-fields">
+              {fields.map((field) => (
+                <div className="document-create-field" key={field.path}>
+                  <div className="document-create-label">
+                    <Text strong>{field.path}</Text>
+                    <Tag>{field.type}</Tag>
+                  </div>
+                  {field.input === 'boolean' ? (
+                    <Select
+                      allowClear
+                      placeholder="请选择"
+                      value={fieldValues[field.path] || undefined}
+                      onChange={(value) =>
+                        setFieldValues((current) => ({
+                          ...current,
+                          [field.path]: value || ''
+                        }))
+                      }
+                      options={[
+                        { value: 'true', label: 'true' },
+                        { value: 'false', label: 'false' }
+                      ]}
+                    />
+                  ) : field.input === 'json' ? (
+                    <Input.TextArea
+                      value={fieldValues[field.path] || ''}
+                      rows={4}
+                      onChange={(event) =>
+                        setFieldValues((current) => ({
+                          ...current,
+                          [field.path]: event.target.value
+                        }))
+                      }
+                      placeholder={field.type === 'nested' ? '[{}]' : '{}'}
+                      className="code-textarea"
+                    />
+                  ) : (
+                    <Input
+                      value={fieldValues[field.path] || ''}
+                      type={field.input === 'number' ? 'number' : 'text'}
+                      onChange={(event) =>
+                        setFieldValues((current) => ({
+                          ...current,
+                          [field.path]: event.target.value
+                        }))
+                      }
+                      placeholder={field.input === 'number' ? '数字' : '字段值'}
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
+          </Spin>
+        ) : (
+          <Input.TextArea
+            value={body}
+            rows={14}
+            onChange={(event) => setBody(event.target.value)}
+            className="code-textarea"
+          />
+        )}
       </Space>
     </Modal>
   )
 }
 
-function MappingPanel(props: { connectionId: string; index: string; onRefresh: () => void }): JSX.Element {
+function MappingPanel(props: {
+  connectionId: string
+  index: string
+  baseIndex: string
+  targetIndex: string
+  onTargetIndexChange: (value: string) => void
+  onRefresh: () => void
+}): JSX.Element {
   const { message } = AntApp.useApp()
   const [mappingText, setMappingText] = useState('{}')
   const [loading, setLoading] = useState(false)
@@ -1453,7 +2839,17 @@ function MappingPanel(props: { connectionId: string; index: string; onRefresh: (
         }
       />
       <div className="sub-head">
-        <Text strong>Mapping JSON</Text>
+        <Space direction="vertical" size={6} className="mapping-index-group">
+          <Text strong>Mapping JSON</Text>
+          <Space.Compact className="mapping-index-control">
+            <Input
+              value={props.targetIndex}
+              onChange={(event) => props.onTargetIndexChange(event.target.value)}
+              placeholder="目标索引，例如 index*"
+            />
+            <Button onClick={() => props.onTargetIndexChange(props.baseIndex)}>恢复</Button>
+          </Space.Compact>
+        </Space>
         <Space>
           <Button icon={<RefreshCw size={16} />} onClick={() => void load()}>
             重新加载

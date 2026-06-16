@@ -88,6 +88,34 @@ export interface DocumentSearchResult {
   took?: number
 }
 
+export type AggregationMetric = 'count' | 'sum' | 'avg' | 'min' | 'max'
+
+export interface DocumentAggregationRequest {
+  connectionId: string
+  index: string
+  queryText?: string
+  groupField?: string
+  groupFields?: string[]
+  metric: AggregationMetric
+  metricField?: string
+  size?: number
+}
+
+export interface DocumentAggregationBucket {
+  keys: Array<string | number | boolean | null>
+  key: string | number | boolean | null
+  count: number
+  value?: number | null
+}
+
+export interface DocumentAggregationResult {
+  buckets: DocumentAggregationBucket[]
+  total: number
+  took?: number
+  metric: AggregationMetric
+  groupFields: string[]
+}
+
 export interface DocumentWriteRequest {
   connectionId: string
   index: string
@@ -102,6 +130,39 @@ export interface DocumentUpdateRequest {
   id: string
   doc: Record<string, unknown>
   refresh?: boolean
+}
+
+export interface DocumentImportItem {
+  id?: string
+  index?: string
+  document: Record<string, unknown>
+}
+
+export interface DocumentImportRequest {
+  connectionId: string
+  index: string
+  documents?: DocumentImportItem[]
+  content?: string
+  mode?: 'existing' | 'create'
+  targetIndex?: string
+  refresh?: boolean
+  operationId?: string
+}
+
+export interface DocumentImportResult {
+  imported: number
+  failed: number
+  targetIndices: string[]
+  overwritten: number
+  created: number
+  mode: 'upsert'
+  targetMode: 'existing' | 'create'
+  indexCreated: boolean
+  errors: Array<{
+    id?: string
+    index?: string
+    message: string
+  }>
 }
 
 export interface IndexCreateRequest {
@@ -132,4 +193,49 @@ export interface MappingUpdateRequest {
   connectionId: string
   index: string
   body: Record<string, unknown>
+}
+
+export interface JsonFileOpenResult {
+  canceled: boolean
+  filePath?: string
+  content?: string
+}
+
+export interface JsonFileSaveRequest {
+  defaultFileName: string
+  content: string
+}
+
+export interface JsonFileSaveResult {
+  canceled: boolean
+  filePath?: string
+}
+
+export interface DocumentExportRequest {
+  connectionId: string
+  index: string
+  queryText?: string
+  operationId?: string
+}
+
+export interface DocumentExportPayload {
+  index: string
+  exportedAt: string
+  total: number
+  exported: number
+  truncated?: boolean
+  from?: number
+  size?: number
+  mappings?: Record<string, unknown>
+  documents: DocumentImportItem[]
+}
+
+export interface OperationProgress {
+  operationId: string
+  type: 'import' | 'export'
+  phase: string
+  current: number
+  total?: number
+  percent?: number
+  message: string
 }

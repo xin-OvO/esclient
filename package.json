@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "electron-vite dev",
-    "build": "node scripts/run-tool.mjs tsc --noEmit && node scripts/run-tool.mjs electron-vite build",
+    "build": "node scripts/generate-icons.mjs && node scripts/run-tool.mjs tsc --noEmit && node scripts/run-tool.mjs electron-vite build",
     "build:main": "esbuild src/main/index.ts --bundle --platform=node --format=esm --external:electron --external:electron-store --external:@elastic/elasticsearch --outfile=out/main/index.js",
     "build:preload": "esbuild src/preload/index.ts --bundle --platform=node --format=esm --external:electron --outfile=out/preload/index.mjs",
     "build:renderer": "node scripts/build-renderer.mjs",
@@ -56,6 +56,7 @@
     ],
     "asar": true,
     "mac": {
+      "icon": "build/icons/icon.icns",
       "target": [
         "dmg",
         "zip"
@@ -64,6 +65,7 @@
       "artifactName": "${productName}-${version}-${arch}.${ext}"
     },
     "win": {
+      "icon": "build/icons/icon.ico",
       "target": [
         "nsis",
         "zip"
@@ -71,6 +73,7 @@
       "artifactName": "${productName}-${version}-${arch}.${ext}"
     },
     "linux": {
+      "icon": "build/icons/icon.png",
       "target": [
         "AppImage",
         "zip"
